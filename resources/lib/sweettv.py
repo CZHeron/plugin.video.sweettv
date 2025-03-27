@@ -1,5 +1,6 @@
 # coding: UTF-8
 import sys
+import threading
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -35,6 +36,9 @@ def getTime(x, y):
 
 
 def refreshChannelList():
+    if not helper.get_setting('logged'):
+        return
+
     timestamp = int(time.time())
     json_data = {
         'epg_limit_prev': 10,
@@ -184,6 +188,8 @@ def startwt():
 
 
 def refreshToken():
+    if not helper.get_setting('logged'):
+        return
     # Reduce the token validity to refresh it a bit earlier
     # In this case we always will have a valid Bearer and token
     if int(time.time()) - int(helper.get_setting('access_token_last_update')) > int(int(
@@ -196,7 +202,7 @@ def refreshToken():
 
         xbmc.log("refresh " + str(jsdata), xbmc.LOGDEBUG)
 
-        if jsdata.get("result", None) == 'COMPLETED' or jsdata.get("result", None) == 'OK':
+        if jsdata.get("access_token", None):
             xbmc.log("Token refresh success", xbmc.LOGDEBUG)
             helper.set_setting('bearer', 'Bearer ' + str(jsdata.get("access_token")))
             helper.headers.update({'authorization': helper.get_setting('bearer')})
@@ -234,14 +240,6 @@ def getEPG(epgid):
     }
     url = 'https://api.sweet.tv/TvService/GetChannels.json'
     jsdata = helper.request_sess(url, 'post', headers=helper.headers, data=json_data, json=True, json_data=True)
-
-    if jsdata.get("code", None) == 16:
-        helper.set_setting('bearer', '')
-        refr = refreshToken()
-        if refr:
-            mainpage(epgid)
-        else:
-            return
 
     if helper.get_setting('reverse_order') == 'Newest':
         reverse_order = True
@@ -288,14 +286,6 @@ def getEPG(epgid):
 @plugin.route('/mainpage/<mainid>')
 def mainpage(mainid):
     jsdata = refreshChannelList()
-
-    if jsdata.get("code", None) == 16:
-        helper.set_setting('bearer', '')
-        refr = refreshToken()
-        if refr:
-            mainpage(mainid)
-        else:
-            return
 
     if jsdata.get("status", None) == 'OK':
         for j in jsdata.get('list', []):
@@ -363,6 +353,54 @@ def logout():
         helper.refresh()
 
 
+class QRPopup(xbmcgui.WindowDialog):
+    exit_flag = False  # Class-level flag
+    running = True
+
+    def __init__(self, auth_code, qrcode_path=None):
+        super(QRPopup, self).__init__()
+
+        self.label = xbmcgui.ControlLabel(320, 100, 640, 40, "Enter code {} on the website,".format(auth_code),
+                                          alignment=6)
+        self.addControl(self.label)
+
+        self.label2 = xbmcgui.ControlLabel(320, 140, 640, 40, "or scan the QR code with your phone!",
+                                           alignment=6)
+        self.addControl(self.label2)
+
+        if qrcode_path is not None:
+            self.qr_image = xbmcgui.ControlImage(490, 180, 300, 300, qrcode_path)
+            self.addControl(self.qr_image)
+
+        self.close_button = xbmcgui.ControlButton(540, 500, 200, 50, "Close", alignment=6)
+        self.addControl(self.close_button)
+        self.setFocus(self.close_button)
+
+        self.monitor_thread = threading.Thread(target=self.monitor_exit_flag)
+        self.monitor_thread.setDaemon(True)
+        self.monitor_thread.start()
+
+    def onControl(self, control):
+        if control == self.close_button:
+            QRPopup.running = False
+            self.close()
+
+    def monitor_exit_flag(self):
+        while QRPopup.running:
+            if QRPopup.exit_flag:
+                QRPopup.running = False
+                self.close()
+            time.sleep(0.5)
+
+
+def show_popup(auth_code, qrcode_path=None):
+    QRPopup.exit_flag = False
+    window = QRPopup(auth_code, qrcode_path)
+    window.doModal()
+    del window
+    return None
+
+
 @plugin.route('/login')
 def login():
     jsdata = helper.request_sess(helper.auth_url, 'post', headers=helper.headers, data=helper.json_data, json=True,
@@ -372,46 +410,74 @@ def login():
         helper.notification('Information', 'Login error')
         helper.set_setting('logged', 'false')
         return
-    dialog = xbmcgui.Dialog()
-    # show loading dialog
-    pDialog = xbmcgui.DialogProgress()
-    pDialog.create('Sweet.tv', "Enter code: {}".format(auth_code))
-    # wait for user to enter code
-    jsdata = {"auth_code": auth_code}
-    from json import dumps
-    json_data = dumps(jsdata, separators=(',', ':'))
-    result = None
-    headers = helper.headers
-    headers.update({'Content-Type': 'application/json'})
 
-    while not result:
-        if pDialog.iscanceled():
-            helper.notification('Information', 'Login interrupted')
-            helper.set_setting('logged', 'false')
-            return
-        jsdata = helper.request_sess(helper.check_auth_url, 'post', headers=headers, data=json_data, json=True,
-                                     json_data=False)
-        xbmc.log("login " + str(jsdata), xbmc.LOGDEBUG)
-        if jsdata.get("result") == "COMPLETED":
-            result = jsdata
+    resp = helper.request_sess("https://api.qrserver.com/v1/create-qr-code/",
+                               params={"data": "sweet.tv/addDevice?connectCode={}".format(auth_code)}, result=False)
+
+    path = None
+    if resp.status_code == 200:
+        try:
+            path = xbmcvfs.translatePath('special://temp') + "{}.png".format(auth_code)
+        except:
+            path = xbmc.translatePath('special://temp') + "{}.png".format(auth_code)
+        f = xbmcvfs.File(path, 'w')
+        f.write(resp.content)
+        f.close()
+
+    def delayed_close():
+        # wait for user to enter code
+        jsdata = {"auth_code": auth_code}
+        from json import dumps
+        json_data = dumps(jsdata, separators=(',', ':'))
+        result = None
+        headers = helper.headers
+        headers.update({'Content-Type': 'application/json'})
+
+        while not result:
+            if not QRPopup.running:
+                helper.notification('Information', 'Login interrupted')
+                helper.set_setting('logged', 'false')
+                if path is not None:
+                    xbmcvfs.delete(path)
+                return
+            jsdata = helper.request_sess(helper.check_auth_url, 'post', headers=headers, data=json_data, json=True,
+                                         json_data=False)
+            xbmc.log("login " + str(jsdata), xbmc.LOGDEBUG)
+            if jsdata.get("result") == "COMPLETED":
+                result = jsdata
+            else:
+                time.sleep(3)
+
+        if result.get("result") == 'COMPLETED':
+
+            access_token = result.get("access_token")
+            refresh_token = result.get("refresh_token")
+            helper.set_setting('bearer', 'Bearer ' + str(access_token))
+            helper.set_setting('refresh_token', str(refresh_token))
+            helper.set_setting('logged', 'true')
+            helper.set_setting('access_token_last_update', str(int(time.time())))
+
+            access_token_lifetime = int(jsdata.get("expires_in"))
+            helper.set_setting('access_token_lifetime', str(access_token_lifetime))
+
+            refreshChannelList()
         else:
-            time.sleep(3)
 
-    if result.get("result") == 'COMPLETED':
+            info = jsdata.get('result', None)
+            helper.notification('Information', info)
 
-        access_token = result.get("access_token")
-        refresh_token = result.get("refresh_token")
-        helper.set_setting('bearer', 'Bearer ' + str(access_token))
-        helper.set_setting('refresh_token', str(refresh_token))
-        helper.set_setting('logged', 'true')
+            helper.set_setting('logged', 'false')
 
-        refreshChannelList()
-    else:
+        QRPopup.exit_flag = True
 
-        info = jsdata.get('result', None)
-        helper.notification('Information', info)
+    t = threading.Thread(target=delayed_close)
+    t.setDaemon(True)
+    t.start()
 
-        helper.set_setting('logged', 'false')
+    show_popup(auth_code, path)
+
+    if path is not None:
+        xbmcvfs.delete(path)
 
     helper.refresh()
 
@@ -441,14 +507,6 @@ def playvid(videoid):
 
         url = helper.base_api_url.format('TvService/OpenStream.json')
         jsdata = helper.request_sess(url, 'post', headers=helper.headers, data=json_data, json=True, json_data=True)
-
-        if jsdata.get("code", None) == 16:
-            helper.set_setting('bearer', '')
-            refr = refreshToken()
-            if refr:
-                playvid(videoid)
-            else:
-                return
 
         if jsdata.get("code", None) == 13:
             xbmcgui.Dialog().notification('Sweet.tv', 'Recording unavailable', xbmcgui.NOTIFICATION_INFO)
